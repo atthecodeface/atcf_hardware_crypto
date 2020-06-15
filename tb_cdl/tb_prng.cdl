@@ -1,0 +1,52 @@
+/** @copyright (C) 2020,  Gavin J Stark.  All rights reserved.
+z2 *
+ * @copyright
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0.
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *
+ * @file   tb_prng.cdl
+ * @brief  Testbench for prng and associated modules
+ *
+ */
+
+/*a Includes
+ */
+include "prng.h"
+
+/*a Module */
+module tb_prng( clock clk         "System clock",
+                input bit reset_n "Active low reset",
+                input bit[8] entropy_in,
+                input t_prng_config            prng_config,
+                output t_prng_status           prng_status,
+                input t_prng_whiteness_control whiteness_control "Control (enable, type etc) of whiteness monitor",
+                output t_prng_whiteness_result whiteness_result  "Results from whiteness monitor"
+    )
+{
+    /*b Clock and reset */
+    default clock clk;
+    default reset active_low reset_n;
+
+    net t_prng_status prng_status;
+    net t_prng_whiteness_result whiteness_result;
+
+    /*b Data, counter and control decode */
+    data_and_counter_decode """
+    """ : {
+        prng prng_i( clk<-clk, reset_n<=reset_n, entropy_in<=entropy_in[0], prng_config<=prng_config, prng_status=>prng_status);
+
+        prng_whiteness_monitor pwm( clk<-clk, reset_n<=reset_n, data_in<=prng_status.data, whiteness_control<=whiteness_control, whiteness_result=>whiteness_result );
+
+        /*b All done */
+    }
+    
+    /*b Done
+     */
+}

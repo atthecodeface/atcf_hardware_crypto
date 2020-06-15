@@ -1,0 +1,403 @@
+/** @copyright (C) 2020,  Gavin J Stark.  All rights reserved.
+ *
+ * @copyright
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0.
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *
+ * @file   prng.cdl
+ * @brief  Pseudo-random number generator of reasonable whiteness and state
+ *
+ * CDL implementation of a four-LFSR PRNG with reseeding based of an entropy
+ * input
+ *
+ */
+/*a Includes
+ */
+include "prng.h"
+
+/*a Constants */
+constant integer lfsr_0_feedback = (47h1<<42) | (47h1<<0);
+constant integer lfsr_1_feedback = (53h1<<52) | (53h1<<51) | (53h1<<47) | (53h1<<0);
+constant integer lfsr_2_feedback = (59h1<<57) | (59h1<<55) | (59h1<<52) | (59h1<<0);
+constant integer lfsr_3_feedback = (61h1<<60) | (61h1<<59) | (61h1<<56) | (61h1<<0);
+        
+/*a Types */
+/*t t_state */
+typedef struct {
+    t_prng_config prng_config;
+    bit     reseed_requested "Asserted if a reseed has been requested and waiting to start collecting_entropy";
+    bit     seed_complete "Asserted for one cycle when a seeding is completed; clears entropy_sr and collecting_entropy";
+    bit     collecting_entropy "Becomes asserted when entropy_in is high and seed requested, deasserted when counter==0xf";
+    bit     entropy_in;
+    bit[4]  counter    "Cleared when collecting_entropy goes high; increments when collecting_entropy is high, saturating at 0xf";
+    bit[16] entropy_sr "Shift entropy in when collecting_entropy";
+    bit[2]  lfsr_to_seed "Which LFSR to seed with entropy_sr when next requested";
+    bit[47] lfsr_0;
+    bit[53] lfsr_1;
+    bit[59] lfsr_2;
+    bit[61] lfsr_3;
+    bit     von_neumann_ready "Asserted every other cycle, indicating data from bottom 2 bits of LFSRs can be used";
+    bit     data_out;
+    bit     data_valid;
+} t_state;
+
+/*t t_combs */
+typedef struct {
+    bit     start_collecting "Asserted to start collecting entropy - if !collecting_entropy, entropy_in is high, and seed requested";
+    bit[47] next_lfsr_0    "LFSR 0 with last_entropy shifted in and remainder performed";
+    bit[53] next_lfsr_1    "LFSR 1 with last_entropy shifted in and remainder performed";
+    bit[59] next_lfsr_2    "LFSR 2 with last_entropy shifted in and remainder performed";
+    bit[61] next_lfsr_3    "LFSR 3 with last_entropy shifted in and remainder performed";
+    bit[4]  vn_lfsr_data   "Von Neumann data extracted from bottom 2 bits of each LFSR; undefined if not valid";
+    bit[4]  vn_lfsr_valid  "Von Neumann valid bit indicating vn_lfsr_data is valid";
+    bit[3]  vn_total_valid "Number of valid bits set in vn_lfsr_valid";
+    bit     vn_data_out    "XOR of all valid bits in vn_lfsr_data";
+    bit     vn_data_valid  "Asserted if vn_data_out is valid (i.e. von_neumann_ready and vn_total_valid is sufficiently large";
+} t_combs;
+
+/*a Module */
+module prng( clock clk         "System clock",
+             input bit reset_n "Active low reset",
+             input bit entropy_in "Entropy from external entropy sources",
+             input t_prng_config prng_config "Configuration of PRNG",
+             output t_prng_status prng_status "Status of PRNG including data"
+    )
+"""
+The PRNG uses four LFSRs that are combined with a simple randomness
+extractor to generate a validated bit stream with equal probabilities
+of zeros and ones, and independence from one bit to the next.  Each
+LFSR is a maximal length LFSR, and the LFSRs have no common factors in
+terms of length other than 1.
+
+The randomness extractor combines two consecutive bits of each LFSR
+using a Von Neumann extractor; this provides from zero to four valid
+data bits (each of which has, if valid, an equal probability of being
+a one or a zero). These data bits are combined using exclusive-or to
+produce an output data bit, whose validity depends on the configured
+minimum number of valid bits being combined (which can be configured
+to be one, two, three or four).
+
+The LFSRs must be sufficiently long that their values have minimal
+inter-dependence; [if LFSR2 and LFSR3 were used, then after only a few
+cycles the values would no longer be inter-dependent.]
+
+The LFSRs are seeded from the entropy in a round-robin fashion upon
+request; entropy is collected in a 16-bit shift register, starting
+when the entropy_in signal goes high (but dropping that bit) and
+recording for 16 successive cycles. When the shift register is full,
+if configured, the entropy shift register is combined with the state
+of the bottom 16-bits of the next LFSR to be seeded, and an
+acknowledge is returned and the shift register cleared. When another
+request is received the process continues, moving on to the next LFSR
+of the four.
+
+The LFSRs are chosen to be of maximal length; LFSRs of length
+47, 53, 59 and 61.
+
+LFSR47 has length 2^47-1 = 2,351 × 4,513 × 13,264,529
+LFSR53 has length 2^53-1 = 6,361 × 69,431 × 20,394,401
+LFSR59 has length 2^59-1 = 179,951 × 3,203,431,780,337
+LFSR61 has length 2^61-1 = 2,305,843,009,213,693,951 (prime)
+
+This PRNG is desinged to be used as part of a TRNG; the entropy from
+ an entropy source is recorded in the LFSRs, and gradually extracted
+ by reading data through the extractor.  Hence for a TRNG this module
+ should be used in conjunction with entropy sources that enable the
+ seeding of the LFSRs with state that is generated from true entropy
+ sources (such as thermal noise etc).
+
+Since the PRNG generates data based on the number of valid data bits
+out of 4 LFSR bits, and if the LFSR bits are truly random and valid
+therefore half of the time, the number of valid data bits will be
+distributed as 0 valid 1/16th of the time, 1 valid as 4/16th, 2 valid
+as 6/16th, 3 valid as 4/16ths, and 4 valid as 1/16th. Given this, the
+probability of *at least* 1 valid bit is 15/16; *at least* 2 valid
+bits is 11/16; *at least* 3 valid bits is 5/16; four valid bits is
+1/16. This can be called 'p'.
+
+The PRNG is designed, then, to be used with a module that will record
+a number (e.g. 32) of consecutive bits when it requires a value, and
+will drop the data when it does not; the outer module should use at
+least a 2N cycle window to record B bits, dropping any extra bits.
+The number of valid bits is a binomial distribution characterized by
+N, p and (1-p).
+
+The probability of most interest is the probability that B bits are
+*not* ready after 2N cycles for each of the configurable minimum number
+of valid bits. This may in some applications be irrelevant; keeping it
+below 1E-6 may be useful if a lot of data is to be extracted, or
+perhaps below 1E-9. Note that if (for example) 32 bits are requested
+and the answer is provided some times after 40 cycles, some times
+after 42, and so on, then considerably more state data is leaking from
+the PRNG than just the random bit values.
+
+Using Python and scipy, the probability of fewer than B valid bits in 2N
+cycles given p is (i.e. leaking information):
+
+  from scipy.stats import binom
+  P=binom.cdf(B-1,N,p)
+
+def find_P_2n(P,B,p,min_n=1,max_n=10000):
+    mid = (max_n+min_n)//2
+    if (mid==min_n) or (mid==max_n): return (2*max_n, 2*max_n/B)
+    P_mid = binom.cdf(B-1,mid,p)
+    if P_mid > P: return find_P_2n(P,B,p,mid,max_n)
+    return find_P_2n(P,B,p,min_n,mid)
+
+def prob(B,p):
+    for P in [1E-3, 1E-6, 1E-9, 1E-12]: print(B,p,find_P_2n(P,B,p))
+
+for p in (1/16, 5/16, 11/16, 15/16):
+    prob(32,p)
+
+ B | min_valid |   p  | 2N |  P    | cyc/bit
+---+-----------+------+----+-------+---------
+32 |     4     | 1/16 |1654| 1E-3  |  51.7
+32 |     4     | 1/16 |2090| 1E-6  |  65.3
+32 |     4     | 1/16 |2458| 1E-9  |  76.8
+32 |     4     | 1/16 |2796| 1E-12 |  87.4
+32 |     3     | 5/16 | 314| 1E-3  |   9.8
+32 |     3     | 5/16 | 388| 1E-6  |  12.1
+32 |     3     | 5/16 | 452| 1E-9  |  14.1
+32 |     3     | 5/16 | 510| 1E-12 |  16.0
+32 |     2     |11/16 | 126| 1E-3  |   3.9
+32 |     2     |11/16 | 150| 1E-6  |   4.6
+32 |     2     |11/16 | 170| 1E-9  |   5.3
+32 |     2     |11/16 | 190| 1E-12 |   5.9
+32 |     1     |15/16 |  80| 1E-3  |   2.5
+32 |     1     |15/16 |  90| 1E-6  |   2.8
+32 |     1     |15/16 |  98| 1E-9  |   3.1
+32 |     1     |15/16 | 106| 1E-12 |   3.3
+
+The preferred min_valid used should not be 4, since that requires all
+four LFSRs to have a value; the preferred min_valid is perhaps 1 or 2.
+
+If the required data rate is about one bit per 4 cycles, then
+min_valid of 1 and 128 cycles provides much better than a 1E-12
+probability of delivery; min_valid of 2 at 128 cycles provides a 1E-3
+probability of failure.
+
+If the required data rate is a *minimum* of one bit per 6 cycles then
+(with probability 1E-12) this is provided by min_valid of 2.
+
+If the required data rate is a *minimum* of one bit per 16 cycles or more then
+(with probability 1E-12) this is provided by min_valid of 2 or 3.
+
+Hence: for a rate of 1 bit per 4 cycles use min_valid of 1; for a rate
+of 1 bit per 6 cycles use min_valid of 2; for a rate of 1 bit per 16
+cycles then use a min_valid of 2 or 3.
+
+Entropy loss discussion:
+========================
+
+Every valid bit of data used (or visible to the system) removes
+a bit of entropy from the combined LFSRs.
+
+Note that *long* LFSRs have essentially equal density of 0 and 1 in their
+lowest bit, and the randomness extractor is (e.g.) configured to
+return a valid 0 only if all the LFSRs have 0 in their bottom bit, and
+a valid 1 only if all the LFSRs have 1 in their bottom bit.
+
+For example, consider a validated data stream of 0110. This indicates
+that at a cycle the LFSRs all have bottom bits 0, at least one cycle
+later they are all 1 (without being 0 in between), and again later
+they are all 1 (without all being 0 in between), and so on.
+
+A simple example would be to consider just two LFSRs - an LFSR2 and an LFSR3.
+They have a repeat of every 21 cycles (since LFSR2 is length 3, LFSR3 length 7)
+Consider a whitener of 01 -> 0, 10-> 1 (XOR), and a Von Neumann extractor following (XORV).
+
+LFSR2: 110110110110110110110
+LFSR3: 111010011101001110100
+XOR:   001100101011111000010001100101011111000010
+XORV:  .......1.1.....1...0...0.1.0.0.0.........1
+
+LFSR2: 110110110110110110110
+LFSR3: 111010011101001110100
+   DV: ...1.1.0...0.....1.1.0...0.....1.1.0...0..
+XORV:  ...1.0.0.0.1...0.0.1.0.1.0.0.1.1.1.1...0.1
+XORV2: ...1.0.....1.....0...0...........1.1...0..
+
+
+
+LFSR sizes:
+
+31 31,28       2,147,483,647
+37 37,36,33,31 223 × 616,318,177
+41 41,38       13,367 × 164,511,353
+43 43,42,38,37 431 × 9,719 × 2,099,863
+*
+47 47,42       2,351 × 4,513 × 13,264,529
+53 53,52,51,47 6,361 × 69,431 × 20,394,401
+59 59,57,55,52 179,951 × 3,203,431,780,337 (13 digits)
+61 61,60,59,56 2,305,843,009,213,693,951
+*
+67 67,66,65,62 193,707,721 × 761,838,257,287 (12 digits)
+
+
+
+"""
+{
+    /*b Clock and reset */
+    default clock clk;
+    default reset active_low reset_n;
+    comb    t_combs  combs;
+    clocked t_state  state = {*=0};
+
+    /*b Configuration in and status out */
+    configuration_logic """
+    """ : {
+        if (state.prng_config.enable || prng_config.enable) {
+            state.prng_config <= prng_config;
+        }
+        prng_status.seed_complete = state.seed_complete;
+        prng_status.data.valid    = state.data_valid;
+        prng_status.data.data     = state.data_out;
+    }
+
+    /*b Entropy control */
+    entropy_control """
+    """ : {
+        combs.start_collecting = 0;
+        if (state.entropy_in && state.reseed_requested) {
+            combs.start_collecting = 1;
+        }
+
+        state.seed_complete <= 0;
+        if (state.collecting_entropy) {
+            state.counter <= state.counter + 1;
+            state.entropy_sr    <= state.entropy_sr<<1;
+            state.entropy_sr[0] <= entropy_in;
+            if (state.counter == -1) {
+                state.collecting_entropy <= 0;
+                state.seed_complete <= 1;
+            }
+        } else {
+            if (state.prng_config.seed_request) {
+                state.reseed_requested <= 1;
+            }
+            if (combs.start_collecting) {
+                state.reseed_requested   <= 0;
+                state.collecting_entropy <= 1;
+                state.counter            <= 0;
+            }
+            if (state.seed_complete) {
+                state.entropy_sr <= 0;
+            }
+        }
+        state.entropy_in <= entropy_in;
+        if (!state.prng_config.enable) {
+            state.reseed_requested <= 0;
+            state.collecting_entropy <= 0;
+            state.seed_complete <= 0;
+            state.entropy_in <= 0;
+            state.entropy_sr <= state.entropy_sr;
+            state.counter <= state.counter;
+        }
+    }
+
+    /*b LFSRs */
+    lfsrs: {
+        /*b Default values */
+        combs.next_lfsr_0 = state.lfsr_0 << 1;
+        combs.next_lfsr_1 = state.lfsr_1 << 1;
+        combs.next_lfsr_2 = state.lfsr_2 << 1;
+        combs.next_lfsr_3 = state.lfsr_3 << 1;
+        if ( state.lfsr_0==0) {combs.next_lfsr_0=1;}
+        if ( state.lfsr_1==0) {combs.next_lfsr_1=1;}
+        if ( state.lfsr_2==0) {combs.next_lfsr_2=1;}
+        if ( state.lfsr_3==0) {combs.next_lfsr_3=1;}
+
+        if (state.lfsr_0[46]) { combs.next_lfsr_0 = combs.next_lfsr_0 ^ lfsr_0_feedback; }
+        if (state.lfsr_1[52]) { combs.next_lfsr_1 = combs.next_lfsr_1 ^ lfsr_1_feedback; }
+        if (state.lfsr_2[58]) { combs.next_lfsr_2 = combs.next_lfsr_2 ^ lfsr_2_feedback; }
+        if (state.lfsr_3[60]) { combs.next_lfsr_3 = combs.next_lfsr_3 ^ lfsr_3_feedback; }
+
+        if (state.seed_complete && (state.lfsr_to_seed==0)) {combs.next_lfsr_0[16;0] = combs.next_lfsr_0[16;0] ^ state.entropy_sr;}
+        if (state.seed_complete && (state.lfsr_to_seed==1)) {combs.next_lfsr_1[16;0] = combs.next_lfsr_1[16;0] ^ state.entropy_sr;}
+        if (state.seed_complete && (state.lfsr_to_seed==2)) {combs.next_lfsr_2[16;0] = combs.next_lfsr_2[16;0] ^ state.entropy_sr;}
+        if (state.seed_complete && (state.lfsr_to_seed==3)) {combs.next_lfsr_3[16;0] = combs.next_lfsr_3[16;0] ^ state.entropy_sr;}
+
+        /*b Record LFSR values */
+        if (state.prng_config.enable) {
+            if (state.seed_complete) { state.lfsr_to_seed <= state.lfsr_to_seed+1; }
+            state.lfsr_0   <= combs.next_lfsr_0;
+            state.lfsr_1   <= combs.next_lfsr_1;
+            state.lfsr_2   <= combs.next_lfsr_2;
+            state.lfsr_3   <= combs.next_lfsr_3;
+        }
+
+        /*b All done */
+    }
+
+    
+    /*b Von Neumann Extractors and data out */
+    von_neumann_extractors: {
+        /*b Data and valid from Von Neumann extraction */
+        combs.vn_lfsr_data[0] = state.lfsr_0[0];
+        combs.vn_lfsr_data[1] = state.lfsr_1[0];
+        combs.vn_lfsr_data[2] = state.lfsr_2[0];
+        combs.vn_lfsr_data[3] = state.lfsr_3[0];
+        combs.vn_lfsr_valid[0] = state.lfsr_0[0] ^ state.lfsr_0[1];
+        combs.vn_lfsr_valid[1] = state.lfsr_1[0] ^ state.lfsr_1[1];
+        combs.vn_lfsr_valid[2] = state.lfsr_2[0] ^ state.lfsr_2[1];
+        combs.vn_lfsr_valid[3] = state.lfsr_3[0] ^ state.lfsr_3[1];
+
+        /*b Calculate total number of valid bits */
+        combs.vn_total_valid = 0;
+        full_switch (combs.vn_lfsr_valid) {
+        case 0:          {combs.vn_total_valid = 0;}
+        case 15:         {combs.vn_total_valid = 4;}
+        case 1,2,4,8:    {combs.vn_total_valid = 1;}
+        case 14,13,11,7: {combs.vn_total_valid = 3;}
+        default:         {combs.vn_total_valid = 2;}
+        }
+
+        /*b Determine data out and its validity */
+        combs.vn_data_out = 0;
+        for (i; 4) {
+            combs.vn_data_out = combs.vn_data_out ^ (combs.vn_lfsr_data[i] & combs.vn_lfsr_valid[i]);
+        }
+        combs.vn_data_valid = state.von_neumann_ready;
+        if (combs.vn_total_valid < state.prng_config.min_valid) {
+            combs.vn_data_valid = 0;
+        }
+
+        /*b Record data out/valid */
+        state.data_valid <= 0;
+        if (state.prng_config.enable) {
+            if (combs.vn_data_valid) {
+                state.data_out   <= combs.vn_data_out;
+            }
+            state.data_valid <= combs.vn_data_valid;
+            state.von_neumann_ready <= !state.von_neumann_ready;
+        }
+
+        /*b All done */
+    }
+
+    /*b Logging */
+    logging: {
+        if (state.prng_config.enable && state.seed_complete) {
+            log("seeding",
+                "lfsr", state.lfsr_to_seed,
+                "entropy", state.entropy_sr,
+                "lfsr_0", state.lfsr_0,
+                "lfsr_1", state.lfsr_1,
+                "lfsr_2", state.lfsr_2,
+                "lfsr_3", state.lfsr_3 );
+        }
+        
+        /*b All done */
+    }
+    
+    /*b Done
+     */
+}

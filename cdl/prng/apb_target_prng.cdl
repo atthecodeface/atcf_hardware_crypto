@@ -1,0 +1,344 @@
+/** @copyright (C) 2020,  Gavin J Stark.  All rights reserved.
+ *
+ * @copyright
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0.
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *
+ * @file   apb_target_prng.cdl
+ * @brief  APB target including the PRNG and whiteness monitor (if required)
+ *
+ * CDL implementation of an APB target including the PRNG and whiteness monitor
+ *
+ */
+/*a Includes
+ */
+include "apb::apb.h"
+include "prng.h"
+
+/*a Constants */
+constant integer cfg_disable_whiteness = 0;
+        
+/*a Types */
+/*t t_apb_address
+ *
+ * APB address map, used to decode paddr
+ *
+ */
+typedef enum [4] {
+    apb_address_config             = 0   "Global configuration",
+    apb_address_status             = 1   "Status",
+    apb_address_prng_config        = 2   "PRNG configuration",
+    apb_address_prng_data          = 3   "PRNG random data",
+    apb_address_whiteness_control  = 4   "Whiteness control (0 if disable_whiteness)",
+    apb_address_whiteness_run_length = 5   "Whiteness run length (0 if disable_whiteness)",
+    apb_address_whiteness_data_0   = 6   "Whiteness data 0 (0 if disable_whiteness)",
+    apb_address_whiteness_data_1   = 7   "Whiteness data 1 (0 if disable_whiteness)",
+} t_apb_address;
+
+/*t t_access
+ *
+ * APB access that is in progress; a decode of psel and paddr
+ *
+ */
+typedef enum [5] {
+    access_none                   "No access being performed",
+    access_write_config           "Write global config",
+    access_read_config            "Read global config",
+    access_read_prng_config            "Read global config",
+    access_write_prng_config            "Read global config",
+    access_read_prng_data            "Read global config",
+    access_read_status            "Read status",
+    access_write_whiteness_control            "Write status",
+    access_write_whiteness_run_length            "Write status",
+    access_read_whiteness_control            "Read status",
+    access_read_whiteness_run_length            "Read status",
+    access_read_whiteness_data_0            "Read status",
+    access_read_whiteness_data_1            "Read status",
+} t_apb_access;
+
+/*t t_combs */
+typedef struct {
+    bit     consume_random_data;
+    bit     consume_whiteness_result;
+    bit[32] next_random_data;
+    bit[4]  random_data_sbox4_in;
+    bit[4]  random_data_sbox4_out;
+} t_combs;
+
+/*t t_whiteness */
+typedef struct {
+    bit monitor_entropy;
+    bit run_continuously;
+} t_whiteness;
+
+/*t t_random_data */
+typedef struct {
+    bit valid;
+    bit[32] data;
+    bit[5] counter;
+} t_random_data;
+
+/*t t_state */
+typedef struct {
+    t_apb_access apb_access;
+    bit locked;
+    bit capture_random_data;
+    t_prng_config prng_config;
+    t_random_data   random_data;
+    t_prng_whiteness_control whiteness_control;
+    t_prng_whiteness_result  whiteness_result;
+    t_whiteness whiteness;
+} t_state;
+
+/*a Module */
+module apb_target_prng( clock clk         "System clock",
+                        input bit reset_n "Active low reset",
+                        input bit entropy_in "Entropy from external entropy sources",
+
+                        input  t_apb_request  apb_request  "APB request",
+                        output t_apb_response apb_response "APB response"
+    )
+"""
+Seeding should be possible:
+
+* continously
+* every N cycles (after monitor result?)
+* after every random data read ?
+* on demand
+
+"""
+{
+    /*b Clock and reset */
+    default clock clk;
+    default reset active_low reset_n;
+    comb    t_combs  combs;
+    clocked t_state  state = {*=0};
+
+    /*b Signals for submodules */
+    comb t_prng_config            prng_config       "Configuration of PRNG";
+    comb t_prng_whiteness_control whiteness_control "Control to whiteness module";
+    comb t_prng_data              whiteness_data_in "Data in to whiteness - from entropy_in or PRNG";
+    net t_prng_status             prng_status "Output from PRNG";
+    net t_prng_whiteness_result   whiteness_result_precfg "Output from whiteness monitor - ignored if disable_whiteness";
+    comb t_prng_whiteness_result  whiteness_result        "Output from whiteness monitor after configuration";
+
+    /*b APB interface */
+    apb_interface_logic """
+    The APB interface is decoded to @a access when @p psel is asserted
+    and @p penable is deasserted - this is the first cycle of an APB
+    access. This permits the access type to be registered, so that the
+    APB @p prdata can be driven from registers, and so that writes
+    will occur correctly when @p penable is asserted.
+
+    The APB read data @p prdata can then be generated based on @a
+    access.
+    """ : {
+        /*b Handle APB read data - may affect pready */
+        apb_response = {*=0, pready=1};
+        combs.consume_random_data = 0;
+        combs.consume_whiteness_result = 0;
+        part_switch (state.apb_access) {
+        case access_read_config: {
+            apb_response.prdata[0] = state.locked;
+        }
+        case access_read_status: {
+            apb_response.prdata[0] = state.locked;
+            apb_response.prdata[1] = state.random_data.valid;
+        }
+        case access_read_prng_config: {
+            apb_response.prdata[0]   = state.prng_config.enable;
+            apb_response.prdata[3;4] = state.prng_config.min_valid;
+        }
+        case access_read_prng_data: {
+            if (state.random_data.valid) {
+                combs.consume_random_data = 1;
+                apb_response.prdata       = state.random_data.data;
+            }
+        }
+        case access_read_whiteness_control: {
+            apb_response.prdata[0]     = state.whiteness_control.request;
+            apb_response.prdata[1]     = state.whiteness.run_continuously;
+            apb_response.prdata[4]     = state.whiteness.monitor_entropy;
+            apb_response.prdata[16;16] = state.whiteness_control.control;
+        }
+        case access_read_whiteness_run_length: {
+            apb_response.prdata = state.whiteness_control.run_length;
+        }
+        case access_read_whiteness_data_0: {
+            apb_response.prdata = state.whiteness_result.data[32;0];
+        }
+        case access_read_whiteness_data_1: {
+            apb_response.prdata = state.whiteness_result.data[32;32];
+            combs.consume_whiteness_result = 1;
+        }
+        }
+
+        /*b Handle APB writes - may affect pready */
+        part_switch (state.apb_access) {
+        case access_write_config: {
+            if (!state.locked) {
+                state.locked <= apb_request.pwdata[0];
+                state.capture_random_data <= apb_request.pwdata[1];
+            }
+        }
+        case access_write_prng_config: {
+            if (!state.locked) {
+                state.prng_config.enable    <= apb_request.pwdata[0];
+                state.prng_config.min_valid <= apb_request.pwdata[3;4];
+            }
+        }
+        case access_write_whiteness_control: {
+            state.whiteness_control.request  <= apb_request.pwdata[0];
+            state.whiteness.run_continuously <= apb_request.pwdata[1];
+            state.whiteness.monitor_entropy  <= apb_request.pwdata[4];
+            state.whiteness_control.control  <= apb_request.pwdata[16;16];
+        }
+        case access_write_whiteness_run_length: {
+            state.whiteness_control.run_length <= apb_request.pwdata;
+        }
+        }
+        state.prng_config.seed_request <= 1;
+
+        /*b Decode access */
+        state.apb_access <= access_none;
+        part_switch (apb_request.paddr[5;0]) {
+        case apb_address_config: {
+            state.apb_access <= apb_request.pwrite ? access_write_config : access_read_config;
+        }
+        case apb_address_status: {
+            state.apb_access <= apb_request.pwrite ? access_none : access_read_status;
+        }
+        case apb_address_prng_config: {
+            state.apb_access <= apb_request.pwrite ? access_write_prng_config : access_read_prng_config;
+        }
+        case apb_address_prng_data: {
+            state.apb_access <= apb_request.pwrite ? access_none : access_read_prng_data;
+        }
+        case apb_address_whiteness_control: {
+            state.apb_access <= apb_request.pwrite ? access_write_whiteness_control : access_read_whiteness_control;
+        }
+        case apb_address_whiteness_run_length: {
+            state.apb_access <= apb_request.pwrite ? access_write_whiteness_run_length : access_read_whiteness_run_length;
+        }
+        case apb_address_whiteness_data_0: {
+            state.apb_access <= apb_request.pwrite ? access_none : access_read_whiteness_data_0;
+        }
+        case apb_address_whiteness_data_1: {
+            state.apb_access <= apb_request.pwrite ? access_none : access_read_whiteness_data_1;
+        }
+        }
+        if (!apb_request.psel || (apb_request.penable && apb_response.pready)) {
+            state.apb_access <= access_none;
+        }
+
+        /*b Handle whiteness result */
+        if (state.whiteness_result.valid) {
+            if (combs.consume_whiteness_result) {
+                state.whiteness_result.valid <= 0;
+                state.whiteness_result.data  <= 0;
+            }
+        } else {
+            if (whiteness_result.valid) {
+                state.whiteness_result.valid <= 1;
+                state.whiteness_result.data  <= whiteness_result.data;
+            }
+        }
+        if (whiteness_result.ack && !state.whiteness.run_continuously) {
+            state.whiteness_control.request <= 0;
+        }
+        if (cfg_disable_whiteness) {
+            state.whiteness <= {*=0};
+            state.whiteness_control <= {*=0};
+            state.whiteness_result  <= {*=0};
+        }
+
+        /*b All done */
+    }
+
+    /*b Random data */
+    random_data """
+    Accumulate the random data from the prng
+    Until the shift register is full, just accumulate the data
+    When the shift register is full and more data needs to be accumulated, use current state
+    (particularly top of shift register) in a nonlinear fashion to not lose that entropy
+    """ : {
+        combs.random_data_sbox4_in = bundle(state.random_data.data[31],state.random_data.data[19],state.random_data.data[11],state.random_data.data[4]);
+        combs.random_data_sbox4_out = 0;
+        full_switch (combs.random_data_sbox4_in) { // This sbox is perfect nonlinear (see prng.py)
+        case 4h0: { combs.random_data_sbox4_out = 3;}
+        case 4h1: { combs.random_data_sbox4_out = 7;}
+        case 4h2: { combs.random_data_sbox4_out = 6;}
+        case 4h3: { combs.random_data_sbox4_out = 4;}
+        case 4h4: { combs.random_data_sbox4_out = 13;}
+        case 4h5: { combs.random_data_sbox4_out = 8;}
+        case 4h6: { combs.random_data_sbox4_out = 9;}
+        case 4h7: { combs.random_data_sbox4_out = 5;}
+        case 4h8: { combs.random_data_sbox4_out = 14;}
+        case 4h9: { combs.random_data_sbox4_out = 15;}
+        case 4ha: { combs.random_data_sbox4_out = 10;}
+        case 4hb: { combs.random_data_sbox4_out = 1;}
+        case 4hc: { combs.random_data_sbox4_out = 2;}
+        case 4hd: { combs.random_data_sbox4_out = 11;}
+        case 4he: { combs.random_data_sbox4_out = 0;}
+        case 4hf: { combs.random_data_sbox4_out = 12;}
+        }
+        combs.next_random_data    = state.random_data.data<<1;
+        combs.next_random_data[0] = prng_status.data.data;
+        if (state.random_data.valid) { // all bits valid, so merge new data with old
+            combs.next_random_data[4;0] = combs.next_random_data[4;0] ^ combs.random_data_sbox4_out;
+        }
+        if (prng_status.data.valid && state.capture_random_data) {
+            state.random_data.counter <= state.random_data.counter-1;
+            if (state.random_data.counter==0) {
+                state.random_data.valid   <= 1;
+                state.random_data.counter <= 0;
+            }
+            state.random_data.data <= combs.next_random_data;
+        }
+        if (combs.consume_random_data) {
+            state.random_data.valid   <= 0;
+            state.random_data.counter <= -1;
+            state.random_data.data    <= 0;
+        }
+    }
+
+    /*b Submodule instances */
+    submodules """
+    """ : {
+
+        prng_config              = state.prng_config;
+        prng prng_i( clk<-clk,
+                     reset_n     <= reset_n,
+                     entropy_in  <= entropy_in,
+                     prng_config <= prng_config,
+                     prng_status => prng_status );
+
+        whiteness_data_in = prng_status.data;
+        if (state.whiteness.monitor_entropy) {
+            whiteness_data_in = {valid=1, data=entropy_in};
+        }
+        whiteness_control = state.whiteness_control;
+        if (cfg_disable_whiteness) {
+            whiteness_control = {*=0};
+        }
+        prng_whiteness_monitor pwm( clk<-clk,
+                                    reset_n <= reset_n,
+                                    data_in <= whiteness_data_in,
+                                    whiteness_control <= whiteness_control,
+                                    whiteness_result => whiteness_result_precfg );
+        whiteness_result = whiteness_result_precfg;
+        if (cfg_disable_whiteness) {
+            whiteness_result = {*=0};
+        }
+    }
+
+    /*b Done
+     */
+}

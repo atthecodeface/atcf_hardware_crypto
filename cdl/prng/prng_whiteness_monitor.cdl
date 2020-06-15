@@ -1,0 +1,523 @@
+/** @copyright (C) 2020,  Gavin J Stark.  All rights reserved.
+z2 *
+ * @copyright
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0.
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *
+ * @file   prng_whiteness_monitor.cdl
+ * @brief  A whiteness monitor for random bit sources
+ *
+ * CDL implementation of a monitor for a stream of valid data bits
+ *
+ * The monitor can be configured to perform a number of different calculations.
+ * It is always configured to operate over N cycles, where N is a 32-bit value.
+ * It returns a result that is 64 bits long, although this will usually split into
+ * a number of subfields.
+ *
+ * It can:
+ *  Count ones (this enables NIST SP800-22r1a frequency/monobit + in block analysis)
+ *  Count toggles (this enables NIST SP800-22r1a number of runs test)
+ *  Maximum run length of ones and maximum run length of zeros (16 bits each)
+ *     (this enables NIST SP800-22r1a longest run of ones test)
+ *  Count of number of occurrences of a specific run length (12 bits) of zero
+ *     and greater than that run length
+ *  Count of non-overlapping N bit sequences (four 16-bit counts)
+ *     This enables NIST SP800-22r1a Non-overlapping templates
+ *  Count of overlapping N bit sequences (four 16-bit counts)
+ *     This enables NIST SP800-22r1a Overlapping templates
+ *  Excursions - count zero crossing and record max and min excursion
+ *     This enables NIST SP800-22r1a Cumulative sum
+ * (Cycles including N? Cycle is cusm=0 to cusum=0; inc if cycle includes N; count cycles)
+ */
+
+/*a Includes
+ */
+include "prng.h"
+
+/*a Types */
+/*t t_monitor_type */
+typedef enum[2] {
+    monitor_type_count_bits=0,
+    monitor_type_run_length=1,
+    monitor_type_template_match=2,
+    monitor_type_max_excursions=3,
+} t_monitor_type;
+
+/*t t_counter_action */
+typedef enum[2] {
+    action_hold=0,
+    action_reset,
+    action_inc,
+    action_inc_ext // Only valid for counters 1 and 3
+} t_counter_action;
+
+/*t t_ictr_action */
+typedef enum[3] {
+    ictr_action_hold=0,
+    ictr_action_reset,
+    ictr_action_inc,
+    ictr_action_dec,
+    ictr_action_shift_and_divide, // for regualr template
+    ictr_action_shift_and_reset, // for nonoverlapping when a match is found
+} t_ictr_action;
+
+/*t t_counters */
+typedef struct {
+    bit[16] ctr0;
+    bit[16] ctr1;
+    bit[16] ctr2;
+    bit[16] ctr3;
+} t_counters;
+
+/*t t_monitor_action */
+typedef struct {
+    t_ictr_action    internal_counter_action;
+    t_counter_action counter0_action;
+    t_counter_action counter1_action;
+    t_counter_action counter2_action;
+    t_counter_action counter3_action;
+    bit[2]           status_write "One bit per status; low is don't touch, high means write data";
+    bit[2]           status_data  "One bit per status; data to use for bit N if status_write[N]";
+} t_monitor_action;
+
+/*t t_combs */
+typedef struct {
+    t_monitor_type   monitor_type;
+    bit              subtype;
+    bit              run_only_valid;
+    bit[8]           template_data "Used in template mode";
+    bit[4]           divider       "Used in template mode";
+    bit[12]          counter       "Used in runs mode and excursion mode";
+    t_prng_data      data;
+    bit              data_toggle "Asserted if data is valid and does not match last data (and last data is valid)";
+    bit              ictr_eq_cfg;
+    bit              neg_ictr_eq_cfg;
+    bit              ictr_eq_ctr2;
+    bit              ictr_eq_ctr3;
+    bit              neg_ictr_eq_ctr3;
+    bit              zero_crossing;
+    bit[8]           template_mask;
+    bit[8]           ictr_masked;
+    bit[4]           template_matches;
+    bit              divide_by_N "Asserted if divide-by-N counter has occurred";
+    bit[10]          ictr_as_shift_reg;
+    t_monitor_action count_bits;
+    t_monitor_action run_length;
+    t_monitor_action template_match;
+    t_monitor_action max_excursions;
+    t_monitor_action selected_monitor;
+} t_combs;
+
+/*t t_state */
+typedef struct {
+    bit     last_data;
+    bit     last_data_valid "Deasserted at start of run, asserted once first bit is valid";
+    bit[16] internal_counter;
+    bit[2]  status "Status bits for the monitoring";
+    bit[32] run_time_remaining;
+    bit     ack "Asserted for one cycle when request is taken (active becomes valid)";
+    bit     active;
+    bit     completed "Indicates counters have final values - data out is zero until this is set";
+    t_counters counters;
+    t_prng_whiteness_control control;
+} t_state;
+
+/*a Module */
+module prng_whiteness_monitor( clock clk         "System clock",
+                               input bit reset_n "Active low reset",
+                               input t_prng_data data_in "Data from PRNG",
+                               input t_prng_whiteness_control whiteness_control "Control (enable, type etc) of whiteness monitor",
+                               output t_prng_whiteness_result whiteness_result  "Results from whiteness monitor,"
+    )
+"""
+The counter is four 16-bit counters which may be chained as two 32-bit counters.
+An internal state counter (16 bit) and shift register (16 bit) is maintained too.
+Experiments run when enabled for a fixed length of time.
+Results are reported as 64 bits of data plus a valid indication
+
+valid data toggle = valid data != last valid data
+
+In count ones/toggles:
+    counter 1 is extension of counter 0
+    counter 3 is extension of counter 2
+    counter 0 is incremented if valid data
+    counter 2 is incremented if valid data of (toggle or one) depending on cfg
+
+In count number of run length / max run length:
+    end of run if valid data toggle
+    if end of run
+        status <= 0
+        internal count <= 0
+        counter 0 is incremented if status[0]
+        counter 1 is incremented if status[1]
+    else if valid data (i.e. continue run)
+        internal count is incremented
+        status[0] <= 1 if (internal count == configured run length-1)
+        status[1] <= 1 if status[0]
+        counter 2 is incremented if internal count == counter 2 and data is 0
+        counter 3 is incremented if internal count == counter 3 and data is 1
+
+In count [non]overlapping N bit sequences:
+    internal count is a shift register of last N bits of valid data and count to N (N<=8)
+    counter 0 is incremented if shift register matches {template,2b00} and status[0]
+    counter 1 is incremented if shift register matches {template,2b01} and status[0]
+    counter 2 is incremented if shift register matches {template,2b10} and status[0]
+    counter 3 is incremented if shift register matches {template,2b11} and status[0]
+    if count == N-1
+        status[0] <= 1
+    else if non-overlapping
+        status[0] <= 0
+
+In max excursions:
+    counter 1 is extension of counter 0
+    internal count increments on valid 1, decrements on valid 0
+    zero crossing if internal count is zero and valid
+    counter 0 is incremented if zero-crossing
+    counter 2 is incremented if internal count == {0,counter2} and valid
+    counter 3 is incremented if ~internal count == {00...00,counter3} and decrement
+
+In cycles:
+    counter 1 is extension of counter 0
+    internal count increments on valid 1, decrements on valid 0
+    zero crossing if internal count is zero and valid
+    counter matches +template if internal count == {0,template} and valid
+    counter matches -template if ~internal count == {0,template} and decrement
+    counter 0 is incremented if zero-crossing
+    counter 2 is incremented if counter matches +template and not status[0]
+    counter 3 is incremented if counter matches -template and not status[1]
+    status <= 0 if zero crossing
+    else
+        status[0] <= 1 if counter matches +template
+        status[1] <= 1 if counter matches -template
+
+"""
+{
+    /*b Clock and reset */
+    default clock clk;
+    default reset active_low reset_n;
+    comb    t_combs  combs;
+    clocked t_state  state = {*=0};
+
+    /*b Data, counter and control decode */
+    data_and_counter_decode """
+    Decode the data in to generate valid, data, and toggle.
+    Decode the current counter values to determine whether there is, e.g.
+    a zero-crossing; if the shift register matches the template; if the counter
+    low bit have hit 'divide-by-N', etc
+    """ : {
+        combs.monitor_type  = state.control.control[2;14];
+        combs.subtype       = state.control.control[13];
+        combs.run_only_valid= state.control.control[12];
+        combs.template_data = state.control.control[8;4];
+        combs.divider       = state.control.control[4;0];
+        combs.counter       = state.control.control[12;0];
+        
+        combs.data.valid = data_in.valid;
+        combs.data.data = data_in.data;
+        combs.data_toggle = combs.data.valid && (state.last_data != combs.data.data);
+
+        combs.ictr_as_shift_reg = state.internal_counter[10;4];
+        combs.divide_by_N = 0;
+        if (state.internal_counter[4;0]==combs.divider) {
+            combs.divide_by_N = 1;
+        }
+
+        combs.ictr_eq_cfg      = 0;
+        combs.neg_ictr_eq_cfg = 0;
+        combs.ictr_eq_ctr2 = 0;
+        combs.ictr_eq_ctr3 = 0;
+        combs.neg_ictr_eq_ctr3 = 0;
+        if (combs.counter == state.internal_counter[12;0]) {
+            combs.ictr_eq_cfg = 1;
+        }
+        if (combs.counter == ~state.internal_counter[12;0]) {
+            combs.neg_ictr_eq_cfg = 1;
+        }
+        if (state.counters.ctr2 == state.internal_counter) {
+            combs.ictr_eq_ctr2 = 1;
+        }
+        if (state.counters.ctr3 == state.internal_counter) {
+            combs.ictr_eq_ctr3 = 1;
+        }
+        if (state.counters.ctr3 == ~state.internal_counter) {
+            combs.neg_ictr_eq_ctr3 = 1;
+        }
+
+        combs.zero_crossing = (state.internal_counter==0);
+
+        combs.template_mask = 8h1;
+        full_switch (combs.divider) {
+        case 1: { combs.template_mask=8h03; }
+        case 2: { combs.template_mask=8h07; }
+        case 3: { combs.template_mask=8h0f; }
+        case 4: { combs.template_mask=8h1f; }
+        case 5: { combs.template_mask=8h3f; }
+        case 6: { combs.template_mask=8h7f; }
+        case 7: { combs.template_mask=8hff; }
+        default: { combs.template_mask=8h1; }
+        }
+        combs.ictr_masked = combs.ictr_as_shift_reg[8;2] & combs.template_mask;
+        combs.template_matches = 0;
+        if (combs.ictr_masked == combs.template_data) {
+            combs.template_matches[0] = (combs.ictr_as_shift_reg[2;0]==0);
+            combs.template_matches[1] = (combs.ictr_as_shift_reg[2;0]==1);
+            combs.template_matches[2] = (combs.ictr_as_shift_reg[2;0]==2);
+            combs.template_matches[3] = (combs.ictr_as_shift_reg[2;0]==3);
+        }
+        
+        /*b All done */
+    }
+    
+    /*b Determine actions for the different modes of operations*/
+    action_decode """
+    Determine the actions to be taken for the different modes.
+
+    The configured mode's decodes are selected further down.
+    """ : {
+        /*b count ones/toggles
+          Count ones if subtype is low; count toggles if subtype is high
+         */
+        combs.count_bits = {*=0};
+        combs.count_bits.counter0_action = action_inc;
+        combs.count_bits.counter1_action = action_inc_ext;
+        if (combs.subtype) {
+            if (combs.data_toggle) {
+                combs.count_bits.counter2_action = action_inc;
+                combs.count_bits.counter3_action = action_inc_ext;
+            }
+        } else {
+            if (combs.data.data) {
+                combs.count_bits.counter2_action = action_inc;
+                combs.count_bits.counter3_action = action_inc_ext;
+            }
+        }
+
+        /*b count number of runs of run length,
+          greater than run length, and max run
+          length of zeros and ones
+         */
+        combs.run_length = {*=0};
+        if (combs.data_toggle) {
+            combs.run_length.status_write = 2b11;
+            combs.run_length.status_data  = 2b00;
+            if (state.status[0]) { combs.run_length.counter0_action = action_inc; } // number of runs matching exactly
+            if (state.status[1]) { combs.run_length.counter1_action = action_inc; } // number of runs longer than match
+            combs.run_length.internal_counter_action = ictr_action_reset;
+        } else {
+            combs.run_length.internal_counter_action = ictr_action_inc;
+            combs.run_length.status_write = 2b01; // always write status 0 (length == required)
+            combs.run_length.status_data  = 2b10; // when writing status 1 always set it (length > required)
+            if (combs.ictr_eq_cfg)      { combs.run_length.status_data[0]=1; }
+            if (state.status[0])        { combs.run_length.status_write[1]=1; }
+            if (combs.ictr_eq_ctr2 && !combs.data.data) { combs.run_length.counter2_action = action_inc; } // max run length of zeros
+            if (combs.ictr_eq_ctr3 &&  combs.data.data) { combs.run_length.counter3_action = action_inc; } // max run length of ones
+        }
+
+        /*b count sequences matching templates (non)overlapping
+          Count overlapping if subtype is 0; nonoverlapping if subtype is 1
+         */
+        combs.template_match = {*=0};
+        combs.template_match.internal_counter_action = ictr_action_shift_and_divide;
+        if (combs.divide_by_N) {
+            combs.template_match.status_write[0] = 1;
+            combs.template_match.status_data[0]  = 1;
+        }
+        if (state.status[0]) {
+            if (combs.template_matches[0]) { combs.template_match.counter0_action = action_inc; } // number matching template,2b00
+            if (combs.template_matches[1]) { combs.template_match.counter1_action = action_inc; } // number matching template,2b01
+            if (combs.template_matches[2]) { combs.template_match.counter2_action = action_inc; } // number matching template,2b10
+            if (combs.template_matches[3]) { combs.template_match.counter3_action = action_inc; } // number matching template,2b11
+
+            if (combs.subtype) { // clear status[0] ONLY if a match if nonoverlapping
+                if (combs.template_matches!=0) {
+                    combs.template_match.counter0_action = action_inc; // nonoverlapping of template
+                    combs.template_match.internal_counter_action = ictr_action_shift_and_reset;
+                    combs.template_match.status_write[0] = 1;
+                    combs.template_match.status_data[0]  = 0;
+                }
+            }
+        }
+
+        /*b max excursions / cycles
+          Count 
+         */
+        combs.max_excursions = {*=0};
+        combs.max_excursions.internal_counter_action = ictr_action_hold; // random walk counter
+        if (combs.data.data) {
+            combs.max_excursions.internal_counter_action = ictr_action_inc;
+        } else {
+            combs.max_excursions.internal_counter_action = ictr_action_dec;
+        }
+        if (combs.zero_crossing) { // Count of occurrences of leaving zero, status <= 0
+            combs.max_excursions.counter0_action = action_inc;
+            combs.max_excursions.counter1_action = action_inc_ext;
+            combs.max_excursions.status_write = 2b11;
+            combs.max_excursions.status_data  = 2b00;
+        }
+        if (!combs.subtype) { // max excursions
+            if (combs.ictr_eq_ctr2) { // max positive excursion
+                combs.max_excursions.counter2_action = action_inc;
+            }
+            if (combs.neg_ictr_eq_ctr3 && !combs.data.data) { // max negative excursion
+                combs.max_excursions.counter3_action = action_inc;
+            }
+        } else { // number of excursions of at least N - status[] indicates already counted this cycle
+            if (combs.ictr_eq_cfg) { // positive excustion of exactly N
+                combs.max_excursions.status_write[0] = 1;
+                combs.max_excursions.status_data[0] = 1;
+                if (!state.status[0]) {
+                    combs.max_excursions.counter2_action = action_inc;
+                }
+            }
+            if (combs.neg_ictr_eq_cfg && !combs.data.data) { // max negative excursion
+                combs.max_excursions.status_write[1] = 1;
+                combs.max_excursions.status_data[1] = 1;
+                if (!state.status[1]) {
+                    combs.max_excursions.counter3_action = action_inc;
+                }
+            }
+        }
+        /*b All done */
+    }
+    
+    /*b Counter logic based on configuration decodes */
+    counter_logic """
+    """ : {
+        combs.selected_monitor = combs.count_bits;
+        full_switch (combs.monitor_type) {
+        case monitor_type_count_bits:         { combs.selected_monitor = combs.count_bits; }
+        case monitor_type_run_length:         { combs.selected_monitor = combs.run_length; }
+        case monitor_type_template_match:     { combs.selected_monitor = combs.template_match; }
+        case monitor_type_max_excursions:     { combs.selected_monitor = combs.max_excursions; }
+        }
+            
+        state.counters <= state.counters;
+        full_switch (combs.selected_monitor.counter0_action) {
+        case action_hold:  { state.counters.ctr0 <= state.counters.ctr0; }
+        case action_inc:   { state.counters.ctr0 <= state.counters.ctr0 + 1; }
+        case action_reset: { state.counters.ctr0 <= 0; }
+        }
+        full_switch (combs.selected_monitor.counter1_action) {
+        case action_hold:    { state.counters.ctr1 <= state.counters.ctr1; }
+        case action_inc:     { state.counters.ctr1 <= state.counters.ctr1 + 1; }
+        case action_reset:   { state.counters.ctr1 <= 0; }
+        case action_inc_ext: { if (state.counters.ctr0==-1) {state.counters.ctr1 <= state.counters.ctr1 + 1;} }
+        }
+        full_switch (combs.selected_monitor.counter2_action) {
+        case action_hold:  { state.counters.ctr2 <= state.counters.ctr2; }
+        case action_inc:   { state.counters.ctr2 <= state.counters.ctr2 + 1; }
+        case action_reset: { state.counters.ctr2 <= 0; }
+        }
+        full_switch (combs.selected_monitor.counter3_action) {
+        case action_hold:    { state.counters.ctr3 <= state.counters.ctr3; }
+        case action_inc:     { state.counters.ctr3 <= state.counters.ctr3 + 1; }
+        case action_reset:   { state.counters.ctr3 <= 0; }
+        case action_inc_ext: { if (state.counters.ctr2==-1) {state.counters.ctr3 <= state.counters.ctr2 + 1;} }
+        }
+
+        for (i; 2) {
+            if (combs.selected_monitor.status_write[i]) {
+                state.status[i] <= combs.selected_monitor.status_data[i];
+            }
+        }
+
+        full_switch (combs.selected_monitor.internal_counter_action) {
+        case ictr_action_hold:             { state.internal_counter <= state.internal_counter; }
+        case ictr_action_reset:            { state.internal_counter <= 0; }
+        case ictr_action_inc:              { state.internal_counter <= state.internal_counter+1; }
+        case ictr_action_dec:              { state.internal_counter <= state.internal_counter-1; }
+        case ictr_action_shift_and_divide: {
+            state.internal_counter[4;0] <= state.internal_counter[4;0] + 1;
+            state.internal_counter[10;4] <= (state.internal_counter[10;4] << 1);
+            state.internal_counter[4]   <= combs.data.data;
+        }
+        case ictr_action_shift_and_reset: {
+            state.internal_counter[4;0] <= 0;
+            state.internal_counter[10;4] <= (state.internal_counter[10;4] << 1);
+            state.internal_counter[4]   <= combs.data.data;
+        }
+        }
+        if (combs.data.valid) {
+            state.last_data       <= combs.data.data;
+            state.last_data_valid <= 1;
+        }
+        if (!state.active) {
+            state.internal_counter <= state.internal_counter;
+            state.status           <= state.status;
+            state.counters         <= state.counters;
+        }
+        if (!combs.data.valid || !state.active) {
+            state.counters         <= state.counters;
+            state.status           <= state.status;
+            state.internal_counter <= state.internal_counter;
+            state.last_data        <= state.last_data;
+            state.last_data_valid  <= state.last_data_valid;
+        }
+        
+        /*b Main control */
+        if (state.completed) {
+            state.completed <= 0;
+        }
+        if (state.active) {
+            if (combs.run_only_valid) {
+                if (combs.data.valid) {
+                    state.run_time_remaining <= state.run_time_remaining - 1;
+                }
+            } else {
+                state.run_time_remaining <= state.run_time_remaining - 1;
+            }
+            state.ack <= 0;
+            state.completed <= 0;
+            if (state.run_time_remaining==0) {
+                state.run_time_remaining <= 0;
+                state.completed <= 1;
+                state.active <= 0;
+            }
+        } else {
+            if (whiteness_control.request) {
+                state.control <= whiteness_control;
+                state.control.request <= 0; // so there is no flop for this - it is always zero even at reset
+                state.run_time_remaining <= whiteness_control.run_length;
+                state.ack <= 1;
+                state.active <= 1;
+                state.internal_counter <= 0;
+                state.last_data_valid  <= 0;
+                state.counters <= {*=0};
+            }
+        }
+        whiteness_result = {*=0};
+        if (state.completed) {
+            whiteness_result.valid = 1;
+            whiteness_result.data = bundle(state.counters.ctr3, state.counters.ctr2, state.counters.ctr1, state.counters.ctr0);
+        }
+        whiteness_result.ack = state.ack;
+        
+        /*b All done */
+    }
+
+
+    /*b Logging
+    logging: {
+        if (state.prng_config.enable && state.seed_complete) {
+            log("seeding",
+                "lfsr", state.lfsr_to_seed,
+                "entropy", state.entropy_sr,
+                "lfsr_0", state.lfsr_0,
+                "lfsr_1", state.lfsr_1,
+                "lfsr_2", state.lfsr_2,
+                "lfsr_3", state.lfsr_3 );
+        }
+        
+    }
+    */
+    
+    /*b Done
+     */
+}

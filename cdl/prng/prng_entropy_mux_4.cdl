@@ -1,0 +1,170 @@
+/** @copyright (C) 2020,  Gavin J Stark.  All rights reserved.
+ *
+ * @copyright
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0.
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *
+ * @file   prng_entropy_mux_4.cdl
+ * @brief  Entropy multipliexed to feed a PRNG
+ *
+ * CDL implementation of an entropy multiplexer, taking up to four
+ * single bit entropy sources using edges on the sources for entropy
+ * and producing a level output of entropy.
+ *
+ * The initial sources of entropy are fed in to LFSRs which clock while
+ * the source is active; the LFSRs are of different lengths, and clock
+ * from the point at which any entropy is detected until there is no entropy
+ * detected and a fixed number of entropy ones and zero has been achieved.
+ *
+ */
+/*a Includes
+ */
+
+/*a Constants */
+constant integer lfsr_0_feedback = 8h71; // 8 bit LFSR
+constant integer lfsr_1_feedback = 7h41; // 7 bit LFSR
+constant integer lfsr_2_feedback = 6h09; // 6 bit LFSR
+constant integer lfsr_3_feedback = 5h09; // 5 bit LFSR
+        
+/*a Types */
+/*t t_state */
+typedef struct {
+    bit active;
+    bit[8] counter;
+    bit[4] last_entropy;
+    bit[8] lfsr_0;
+    bit[7] lfsr_1;
+    bit[6] lfsr_2;
+    bit[5] lfsr_3;
+    bit    entropy_out;
+} t_state;
+
+
+/*t t_combs */
+typedef struct {
+    bit[4] entropy_detected "Asserted if last_entropy != entropy_in for each bit";
+    bit    activate         "Asserted if any entropy is detected";
+    bit[8] next_lfsr_0      "LFSR 0 with last_entropy shifted in and remainder performed";
+    bit[7] next_lfsr_1      "LFSR 0 with last_entropy shifted in and remainder performed";
+    bit[6] next_lfsr_2      "LFSR 0 with last_entropy shifted in and remainder performed";
+    bit[5] next_lfsr_3      "LFSR 0 with last_entropy shifted in and remainder performed";
+    bit    next_entropy_out;
+} t_combs;
+
+/*a Module */
+module prng_entropy_mux_4( clock clk         "System clock",
+                           input bit reset_n "Active low reset",
+                           input bit[4] entropy_in,
+                           output bit entropy_out
+    )
+"""
+This module multiplexes some entropy sources together, providing a single entropy out.
+
+The expectation is that the enropy source inputs would be tied to
+various bus controls, preferably derived from asynchronous sources
+(such as receive start-of-packet from an Ethernet interface).
+
+The multiplexer does not simple XOR the entropy sources; it uses LFSRs
+(different length for each source) to spread the entropy from a single
+bit over more than one clock cycle.
+
+The benefit of spreading the entropy is not ton increase the entropy,
+but to reduce the chances of two simultaneous events cancelling each
+other out; the entropy of the timing of event A is spread so that
+there is still an output even if the timing of event B matches it.
+
+The downside to using the LFSRs is that the entropy spread over many
+ticks from two event sources could cancel each other out in just the
+same way; however, if each entropy sources has a probability of being
+asserted of much less than half, then the chance of cancellation is
+removed with the LFSR design.
+
+The LFSRs do not run constantly; they only operate for a small number
+of clocks after any entropy source toggles.  Because of this, a pair
+of entropy muxes may be used back to back to combine up to 16 entropy
+sources in a system without issue.
+
+LFSR sizes:
+
+31 31,28       2,147,483,647
+37 37,36,33,31 223 × 616,318,177
+41 41,38       13,367 × 164,511,353
+43 43,42,38,37 431 × 9,719 × 2,099,863
+*
+47 47,42       2,351 × 4,513 × 13,264,529
+53 53,52,51,47 6,361 × 69,431 × 20,394,401
+59 59,57,55,52 179,951 × 3,203,431,780,337 (13 digits)
+61 61,60,59,56 2,305,843,009,213,693,951
+*
+67 67,66,65,62 193,707,721 × 761,838,257,287 (12 digits)
+
+
+
+"""
+{
+    /*b Clock and reset */
+    default clock clk;
+    default reset active_low reset_n;
+    comb    t_combs  combs;
+    clocked t_state  state = {*=0};
+
+    /*b Entropy in */
+    entropy_logic """
+    """ : {
+        combs.entropy_detected = entropy_in ^ state.last_entropy;
+        combs.next_entropy_out = state.lfsr_0[0] ^ state.lfsr_1[0] ^ state.lfsr_2[0] ^ state.lfsr_3[0];
+        combs.next_lfsr_0 = bundle(state.lfsr_0[7;0], combs.entropy_detected[0]) ^ (state.lfsr_0[7] ? lfsr_0_feedback:8b0);
+        combs.next_lfsr_1 = bundle(state.lfsr_1[6;0], combs.entropy_detected[1]) ^ (state.lfsr_1[6] ? lfsr_1_feedback:7b0);
+        combs.next_lfsr_2 = bundle(state.lfsr_2[5;0], combs.entropy_detected[2]) ^ (state.lfsr_2[5] ? lfsr_2_feedback:6b0);
+        combs.next_lfsr_3 = bundle(state.lfsr_3[4;0], combs.entropy_detected[3]) ^ (state.lfsr_3[4] ? lfsr_3_feedback:5b0);
+        combs.activate = 0;
+        if (combs.entropy_detected !=0) {
+            combs.activate = 1;
+        }
+        if (state.active || combs.activate) {
+            state.last_entropy <= entropy_in;
+            state.lfsr_0 <= combs.next_lfsr_0;
+            state.lfsr_1 <= combs.next_lfsr_1;
+            state.lfsr_2 <= combs.next_lfsr_2;
+            state.lfsr_3 <= combs.next_lfsr_3;
+            state.entropy_out <= combs.next_entropy_out;
+        }
+        if (combs.activate) {
+            state.counter <= 0;
+            state.active <= 1;
+        } else {
+            if (state.active && (combs.next_entropy_out==0)) {
+                state.counter <= state.counter + 1;
+                if (state.counter==15) {
+                    state.active <= 0;
+                }
+            }
+        }
+        entropy_out = state.entropy_out;
+    }
+    logging: {
+        if (state.active || combs.activate) {
+            log("entropy_out",
+                "active", state.active,
+                "count", state.counter,
+                "entropy",combs.next_entropy_out);
+        }
+    }
+
+    /*b Done
+     */
+}
+
+/*a Editor preferences and notes
+mode: c ***
+c-basic-offset: 4 ***
+c-default-style: (quote ((c-mode . "k&r") (c++-mode . "k&r"))) ***
+outline-regexp: "/\\\*a\\\|[\t ]*\/\\\*[b-z][\t ]" ***
+*/
